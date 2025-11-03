@@ -376,6 +376,11 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                                                       self._sampling_period, self._cold_tolerance,
                                                       self._hot_tolerance)
             self._pid_controller.mode = "AUTO"
+        self._time_passed = 0
+        self._time_off = 0
+        self._time_on = 0
+        self._temp_gap_to_target = 0
+        self._predicted_temp_increase = 0
 
     async def async_added_to_hass(self):
         """Run when entity about to be added."""
@@ -674,8 +679,19 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             "ki": self._ki,
             "kd": self._kd,
             "ke": self._ke,
+            "pwm": self._pwm,
             "pid_mode": self.pid_mode,
-            "pid_i": 0 if self._autotune != "none" else self.pid_control_i,
+            "pid_p": self.pid_control_p,
+            "pid_i": self.pid_control_i,
+            "pid_d": self.pid_control_d,
+            "pid_e": self.pid_control_e,
+            "pid_dt": self._dt,
+            "last_heat_cycle_time": self._last_heat_cycle_time,
+            "time_passed": self._time_passed,
+            "time_off": self._time_off,
+            "time_on": self._time_on,
+            "temp_gap_to_target": self._temp_gap_to_target,
+            "predicted_temp_increase": self._predicted_temp_increase,
         }
         if self._debug:
             device_state_attributes.update({
@@ -866,9 +882,12 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
     @callback
     def _async_switch_changed(self, event: Event[EventStateChangedData]):
         """Handle heater switch state changes."""
+        event_type = event.event_type
         new_state = event.data["new_state"]
         if new_state is None:
+            _LOGGER.debug("%s: Switch change event received, new state is None, ignoring.", self.entity_id)
             return
+        _LOGGER.debug("%s: Switch change event received, writing state to DB.", self.entity_id)
         self.async_write_ha_state()
 
     @callback
@@ -930,8 +949,13 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             expected = STATE_ON
             if self._heater_polarity_invert:
                 expected = STATE_OFF
-            return any([self.hass.states.is_state(heater_or_cooler_entity, expected) for heater_or_cooler_entity
-                        in self.heater_or_cooler_entity])
+            expected_states = []
+            for heater_or_cooler_entity in self.heater_or_cooler_entity:
+                state = self.hass.states.is_state(heater_or_cooler_entity, expected)
+                _LOGGER.debug("%s: checking %s state is %s: %s", self.entity_id, heater_or_cooler_entity,
+                              expected, "OK" if state else "NOK")
+                expected_states.append(state)
+            return any(expected_states)
         else:
             """If the valve device is currently active."""
             is_active = False
@@ -981,6 +1005,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 service = SERVICE_TURN_OFF
             else:
                 service = SERVICE_TURN_ON
+            _LOGGER.debug("%s: Calling %s service on %s", self.entity_id, str(service),
+                          str(heater_or_cooler_entity))
             await self.hass.services.async_call(HA_DOMAIN, service, data)
 
     async def _async_heater_turn_off(self, force=False):
@@ -1006,6 +1032,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                     service = SERVICE_TURN_ON
                 else:
                     service = SERVICE_TURN_OFF
+                _LOGGER.debug("%s: Calling %s service on %s", self.entity_id, str(service),
+                              str(heater_or_cooler_entity))
                 await self.hass.services.async_call(HA_DOMAIN, service, data)
 
     async def _async_set_valve_value(self, value: float):
@@ -1153,10 +1181,62 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             # time_off is too short, increase time_on and time_off
             time_on *= self._min_off_cycle_duration.seconds / time_off
             time_off = self._min_off_cycle_duration.seconds
+        
         if self._is_device_active:
-            if time_on <= time_passed or self._force_off:
+            # --- 새로운 예측 정지 로직 시작 ---
+            predictive_stop = False
+            
+            # 예측 정지를 위한 조건 확인:
+            # 1. 이전 온도값이 있어야 함
+            # 2. 현재 온도가 목표 온도보다 낮아야 함 (이미 높으면 예측 의미 없음)
+            if self._previous_temp is not None and self._current_temp < self._target_temp:
+                delta_time_sec = self._cur_temp_time - self._previous_temp_time
+                
+                # 시간 변화가 있고, 온도가 상승 중일 때만 예측 수행
+                if delta_time_sec > 0:
+                    delta_temp = self._current_temp - self._previous_temp
+                    if delta_temp > 0:
+                        # 1. 분당 온도 상승률 계산
+                        rate_per_minute = (delta_temp / delta_time_sec) * 60.0
+                        
+                        # 2. 남은 PWM 가열 시간 계산 (분 단위)
+                        remaining_time_on_sec = time_on - time_passed
+                        if remaining_time_on_sec > 0:
+                            remaining_time_on_min = remaining_time_on_sec / 60.0
+                            
+                            # 3. 예상 추가 상승 온도 계산
+                            predicted_temp_increase = rate_per_minute * remaining_time_on_min
+                            self._predicted_temp_increase = predicted_temp_increase
+                            
+                            # 4. 목표까지 남은 온도 계산
+                            temp_gap_to_target = self._target_temp - self._current_temp
+                            self._temp_gap_to_target = temp_gap_to_target
+                            
+                            _LOGGER.debug(
+                                "%s: Predictive check: Gap=%.2f°C, Rate=%.2f°C/min, RemainingTime=%.1fmin, PredictedIncrease=%.2f°C",
+                                self.entity_id, temp_gap_to_target, rate_per_minute, remaining_time_on_min, predicted_temp_increase
+                            )
+                            
+                            # 5. 제안된 핵심 로직: 남은 온도가 예상 상승 온도보다 작거나 같으면 정지
+                            if temp_gap_to_target <= predicted_temp_increase:
+                                _LOGGER.info(
+                                    "%s: Predictive stop triggered! Temp gap (%.2f°C) is smaller than predicted increase (%.2f°C).",
+                                    self.entity_id, temp_gap_to_target, predicted_temp_increase
+                                )
+                                predictive_stop = True
+                                
+                                # --- 피드백 로직 추가 ---
+                                # 예측 정지가 발동되면 과도하게 누적된 적분항을 리셋하여 다음 사이클에 영향을 주지 않도록 함
+                                _LOGGER.debug("%s: Calling clear_integral due to predictive stop.", self.entity_id)
+                                await self.clear_integral()
+                                # --- 피드백 로직 종료 ---
+                                
+            # --- 새로운 예측 정지 로직 종료 ---
+        
+            # 최종 정지 조건: ON 시간이 다 되었거나, 예측 정지가 발동되었거나, 강제 OFF 신호가 있을 때
+            if time_on <= time_passed or predictive_stop or self._force_off:
                 _LOGGER.info(
-                    "%s: ON time passed. Request turning OFF %s",
+                    "%s: ON time passed or predictive stop. Request turning OFF %s",
                     self.entity_id,
                     ", ".join([entity for entity in self.heater_or_cooler_entity])
                 )
@@ -1187,5 +1267,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 )
                 if self._keep_alive:
                     await self._async_heater_turn_off()
+        
+        self._time_off = time_off
+        self._time_on = time_on
         self._force_on = False
         self._force_off = False
