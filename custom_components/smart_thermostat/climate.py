@@ -377,10 +377,8 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                                                       self._hot_tolerance)
             self._pid_controller.mode = "AUTO"
         self._time_passed = 0
-        self._time_off = 0
+        self._time_off = 0 
         self._time_on = 0
-        self._temp_gap_to_target = 0
-        self._predicted_temp_increase = 0
 
     async def async_added_to_hass(self):
         """Run when entity about to be added."""
@@ -690,8 +688,6 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
             "time_passed": self._time_passed,
             "time_off": self._time_off,
             "time_on": self._time_on,
-            "temp_gap_to_target": self._temp_gap_to_target,
-            "predicted_temp_increase": self._predicted_temp_increase,
         }
         if self._debug:
             device_state_attributes.update({
@@ -1148,7 +1144,26 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
 
     async def set_control_value(self):
         """Set Output value for heater"""
+        
+        # [수정됨] 과열 방지 및 안전 차단 로직 추가
+        # 1. 목표 온도 도달 여부 확인
+        is_overheated = False
+        if self._current_temp is not None and self._target_temp is not None:
+            # 현재 온도가 목표 온도보다 0.1도 이상 높으면 무조건 차단 (방향성 상관없이 안전 우선)
+            if self._current_temp >= (self._target_temp + 0.1):
+                is_overheated = True
+
+        if is_overheated:
+            if self._control_output > 0:
+                _LOGGER.info(
+                    "%s: Overheat protection triggered! Temp (%.2f) >= Target (%.2f). Forcing output to 0.",
+                    self.entity_id, self._current_temp, self._target_temp
+                )
+                self._control_output = 0
+                await self.clear_integral() # 적분항 초기화하여 미래의 오버슈팅 방지
+
         if self._pwm:
+            # 100% 출력 처리 (if -> elif 변경 없이 기존 논리 유지하되 안전장치 적용됨)
             if abs(self._control_output) == self._difference:
                 if not self._is_device_active:
                     _LOGGER.info("%s: Output is %s. Request turning ON %s", self.entity_id,
@@ -1161,114 +1176,65 @@ class SmartThermostat(ClimateEntity, RestoreEntity, ABC):
                 if self._is_device_active:
                     _LOGGER.info("%s: Output is 0. Request turning OFF %s", self.entity_id,
                                  ", ".join([entity for entity in self.heater_or_cooler_entity]))
-                    self._time_changed = time.time()
+                    self._time_changed = time.time() # 0으로 꺼질 때도 타이머 리셋 권장
                 await self._async_heater_turn_off()
         else:
             await self._async_set_valve_value(abs(self._control_output))
 
     async def pwm_switch(self):
-        """turn off and on the heater proportionally to control_value."""
-        time_passed = time.time() - self._time_changed
-        # Compute time_on based on PWM duration and PID output
+        """turn off and on the heater based on time period (Time-based Logic)."""
+        # [수정됨] 시간 기반 제어로 변경하여 상태 지연에 의한 무한 루프 방지
+        
+        now = time.time()
+        time_passed = now - self._time_changed
+        
+        # 사이클 리셋: PWM 주기가 지났으면 기준 시간을 현재로 초기화
+        if time_passed >= self._pwm:
+            self._time_changed = now
+            time_passed = 0
+            # 주기 리셋 시 강제 플래그 초기화
+            self._force_on = False
+            self._force_off = False
+
+        # PID 출력에 따른 ON 시간 계산
         time_on = self._pwm * abs(self._control_output) / self._difference
-        time_off = self._pwm - time_on
-        # Check time_on and time_off are not too short
+        
+        # 최소 가동/정지 시간 보정
         if 0 < time_on < self._min_on_cycle_duration.seconds:
-            # time_on is too short, increase time_off and time_on
-            time_off *= self._min_on_cycle_duration.seconds / time_on
             time_on = self._min_on_cycle_duration.seconds
-        if 0 < time_off < self._min_off_cycle_duration.seconds:
-            # time_off is too short, increase time_on and time_off
-            time_on *= self._min_off_cycle_duration.seconds / time_off
-            time_off = self._min_off_cycle_duration.seconds
-        
-        if self._is_device_active:
-            # --- 새로운 예측 정지 로직 시작 ---
-            predictive_stop = False
-            
-            # 예측 정지를 위한 조건 확인:
-            # 1. 이전 온도값이 있어야 함
-            # 2. 현재 온도가 목표 온도보다 낮아야 함 (이미 높으면 예측 의미 없음)
-            if self._previous_temp is not None and self._current_temp < self._target_temp:
-                delta_time_sec = self._cur_temp_time - self._previous_temp_time
-                
-                # 시간 변화가 있고, 온도가 상승 중일 때만 예측 수행
-                if delta_time_sec > 0:
-                    delta_temp = self._current_temp - self._previous_temp
-                    if delta_temp > 0:
-                        # 1. 분당 온도 상승률 계산
-                        rate_per_minute = (delta_temp / delta_time_sec) * 60.0
-                        
-                        # 2. 남은 PWM 가열 시간 계산 (분 단위)
-                        remaining_time_on_sec = time_on - time_passed
-                        if remaining_time_on_sec > 0:
-                            remaining_time_on_min = remaining_time_on_sec / 60.0
-                            
-                            # 3. 예상 추가 상승 온도 계산
-                            predicted_temp_increase = rate_per_minute * remaining_time_on_min
-                            self._predicted_temp_increase = predicted_temp_increase
-                            
-                            # 4. 목표까지 남은 온도 계산
-                            temp_gap_to_target = self._target_temp - self._current_temp
-                            self._temp_gap_to_target = temp_gap_to_target
-                            
-                            _LOGGER.debug(
-                                "%s: Predictive check: Gap=%.2f°C, Rate=%.2f°C/min, RemainingTime=%.1fmin, PredictedIncrease=%.2f°C",
-                                self.entity_id, temp_gap_to_target, rate_per_minute, remaining_time_on_min, predicted_temp_increase
-                            )
-                            
-                            # 5. 제안된 핵심 로직: 남은 온도가 예상 상승 온도보다 작거나 같으면 정지
-                            if temp_gap_to_target <= predicted_temp_increase:
-                                _LOGGER.info(
-                                    "%s: Predictive stop triggered! Temp gap (%.2f°C) is smaller than predicted increase (%.2f°C).",
-                                    self.entity_id, temp_gap_to_target, predicted_temp_increase
-                                )
-                                predictive_stop = True
-                                
-                                # --- 피드백 로직 추가 ---
-                                # 예측 정지가 발동되면 과도하게 누적된 적분항을 리셋하여 다음 사이클에 영향을 주지 않도록 함
-                                _LOGGER.debug("%s: Calling clear_integral due to predictive stop.", self.entity_id)
-                                await self.clear_integral()
-                                # --- 피드백 로직 종료 ---
-                                
-            # --- 새로운 예측 정지 로직 종료 ---
-        
-            # 최종 정지 조건: ON 시간이 다 되었거나, 예측 정지가 발동되었거나, 강제 OFF 신호가 있을 때
-            if time_on <= time_passed or predictive_stop or self._force_off:
+        elif (self._pwm - time_on) > 0 and (self._pwm - time_on) < self._min_off_cycle_duration.seconds:
+            time_on = self._pwm - self._min_off_cycle_duration.seconds
+            if time_on < 0: time_on = self._pwm
+
+        # [핵심 수정] 기기 상태(_is_device_active)가 아닌 '시간'을 기준으로 판단
+        should_be_on = time_passed < time_on
+
+        if should_be_on:
+            # 켜져 있어야 할 시간 구간
+            if not self._is_device_active or self._force_on:
                 _LOGGER.info(
-                    "%s: ON time passed or predictive stop. Request turning OFF %s",
-                    self.entity_id,
-                    ", ".join([entity for entity in self.heater_or_cooler_entity])
-                )
-                await self._async_heater_turn_off()
-                self._time_changed = time.time()
-            else:
-                _LOGGER.info(
-                    "%s: Time until %s turns OFF: %s sec",
-                    self.entity_id,
-                    ", ".join([entity for entity in self.heater_or_cooler_entity]),
-                    int(time_on - time_passed)
-                )
-                if self._keep_alive:
-                    await self._async_heater_turn_on()
-        else:
-            if time_off <= time_passed or self._force_on:
-                _LOGGER.info(
-                    "%s: OFF time passed. Request turning ON %s", self.entity_id,
-                    ", ".join([entity for entity in self.heater_or_cooler_entity])
+                    "%s: PWM Period ON (Target: %.1fs, Passed: %.1fs). Request turning ON", 
+                    self.entity_id, time_on, time_passed
                 )
                 await self._async_heater_turn_on()
-                self._time_changed = time.time()
-            else:
+            elif self._keep_alive:
+                 await self._async_heater_turn_on()
+        else:
+            # 꺼져 있어야 할 시간 구간
+            if self._is_device_active or self._force_off:
                 _LOGGER.info(
-                    "%s: Time until %s turns ON: %s sec", self.entity_id,
-                    ", ".join([entity for entity in self.heater_or_cooler_entity]),
-                    int(time_off - time_passed)
+                    "%s: PWM Period OFF (Target: %.1fs, Passed: %.1fs). Request turning OFF", 
+                    self.entity_id, time_on, time_passed
                 )
-                if self._keep_alive:
-                    await self._async_heater_turn_off()
+                await self._async_heater_turn_off()
+            elif self._keep_alive:
+                 await self._async_heater_turn_off()
         
-        self._time_off = time_off
+        # 상태 표시용 변수 업데이트
         self._time_on = time_on
+        self._time_off = self._pwm - time_on
+        self._time_passed = time_passed
+        
+        # 일회성 플래그 초기화
         self._force_on = False
         self._force_off = False
